@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -37,6 +38,8 @@ from evalhub.adapter import (
 from evalhub.adapter.auth import resolve_model_credentials
 from evalhub.adapter.mlflow import MlflowArtifact
 
+from themes import RED_HAT_CLEAR_DASHBOARD_CSS, RED_HAT_DASHBOARD_JS_PATCHES
+
 try:
     from clear_eval.agentic.pipeline.run_clear_agentic_eval import (
         create_output_structure,
@@ -53,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 
 def _local_only_run() -> bool:
-    """True when running without Eval Hub callbacks or MLflow (local iteration on job.json)."""
+    """True for local Eval Hub mode (no sidecar); drives DefaultCallbacks without callback_url."""
     mode = os.getenv("EVALHUB_MODE", "").strip().lower()
     if mode == "local":
         return True
@@ -166,6 +169,82 @@ def _preserve_html_reports_from_clear_output(output_dir: Path) -> list[Path]:
             except OSError as exc:
                 logger.warning("Could not preserve HTML %s: %s", p, exc)
     return saved
+
+
+def _patch_red_hat_dashboard_js(html: str) -> str:
+    """Align embedded canvas/table helpers with Red Hat neutrals and primary reds."""
+    out = html
+    for old, new in RED_HAT_DASHBOARD_JS_PATCHES:
+        out = out.replace(old, new)
+    return out
+
+
+def _apply_red_hat_clear_dashboard_html(html: str) -> str:
+    """Replace CLEAR's default dashboard stylesheet with Red Hat branded CSS and patch embedded JS."""
+    out = re.sub(
+        r"<style\b[^>]*>.*?</style>",
+        f"<style>\n{RED_HAT_CLEAR_DASHBOARD_CSS}\n</style>",
+        html,
+        count=1,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    out = re.sub(
+        r"<title>[^<]*</title>",
+        "<title>Agentic Workflow Dashboard — Red Hat</title>",
+        out,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    # Browsers often cache file:// heavily; hint reload + stamp so “View Source” proves a fresh write.
+    if "http-equiv=\"Cache-Control\"" not in out:
+        out = out.replace(
+            '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
+            '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+            '<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">\n'
+            '<meta http-equiv="Pragma" content="no-cache">',
+            1,
+        )
+    stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    out = re.sub(
+        r"<html lang=\"en\">(?:<!-- ibm-clear-adapter red_hat_theme .*?-->)?",
+        f'<html lang="en"><!-- ibm-clear-adapter red_hat_theme {stamp} -->',
+        out,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    return _patch_red_hat_dashboard_js(out)
+
+
+def _use_clear_default_dashboard_html(theme: str | None) -> bool:
+    """Whether to keep CLEAR's stock dashboard HTML.
+
+    JobSpec ``parameters.clear_dashboard_theme``:
+    omit or use ``red_hat`` / ``redhat`` → Red Hat styling (default).
+    Use ``clear``, ``default``, ``original``, ``ibm``, ``none``, ``false``, ``0``, ``off`` → no rewrite.
+    """
+    if theme is None:
+        return False
+    t = theme.strip().lower()
+    if t in ("clear", "default", "original", "ibm", "none", "false", "0", "off"):
+        return True
+    return False
+
+
+def _apply_clear_dashboard_theme(html_paths: list[Path], theme: str | None) -> None:
+    """Apply Red Hat styling to preserved CLEAR HTML unless parameters opt out."""
+    if _use_clear_default_dashboard_html(theme):
+        return
+    for path in html_paths:
+        if path.suffix.lower() != ".html" or not path.is_file():
+            continue
+        try:
+            original = path.read_text(encoding="utf-8")
+            updated = _apply_red_hat_clear_dashboard_html(original)
+            if updated != original:
+                path.write_text(updated, encoding="utf-8")
+                logger.info("Applied Red Hat dashboard styling to %s", path.name)
+        except OSError as exc:
+            logger.warning("Could not apply dashboard theme to %s: %s", path, exc)
 
 
 class ClearAdapter(FrameworkAdapter):
@@ -338,6 +417,10 @@ class ClearAdapter(FrameworkAdapter):
             )
 
             clear_html_artifacts = _preserve_html_reports_from_clear_output(output_dir)
+            _apply_clear_dashboard_theme(
+                clear_html_artifacts,
+                (config.parameters or {}).get("clear_dashboard_theme"),
+            )
             self._cleanup_intermediate_files(output_dir, str(json_results_path))
 
             final_results_path = output_dir / "clear_results.json"
@@ -741,10 +824,6 @@ class ClearAdapter(FrameworkAdapter):
         metrics_summary: dict[str, Any],
         clear_html_artifacts: Optional[list[Path]] = None,
     ) -> str | None:
-        if _local_only_run():
-            logger.info("MLflow skipped: local-only run (EVALHUB_MODE=local or CLEAR_LOCAL_ONLY=1)")
-            return None
-
         name = (config.experiment_name or "").strip()
         if not name:
             raw = config.parameters.get("mlflow_experiment_name")
