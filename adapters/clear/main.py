@@ -55,6 +55,38 @@ except ImportError as exc:
 logger = logging.getLogger(__name__)
 
 
+def _merge_agentic_config_with_clear_defaults(agentic_config: dict[str, Any]) -> dict[str, Any]:
+    """Merge job ``parameters`` into CLEAR's packaged default agentic YAML.
+
+    Mirrors the CLEAR CLI: the job supplies overrides only; defaults such as
+    ``input_columns`` come from ``default_agentic_config.yaml``. Imports are
+    deferred to this call so importing ``main`` does not require resolving
+    ``clear_eval.pipeline`` (optional in some environments).
+    """
+    from clear_eval.agentic.pipeline.utils import load_pipeline_config
+
+    return load_pipeline_config(**agentic_config)
+
+
+def _normalize_clear_agent_entry(agent_data: Any) -> dict[str, Any]:
+    """Return the block that holds ``agent_summary`` / ``issues_catalog`` for metrics.
+
+    CLEAR 2.x nests these under ``reasoning_eval`` (and optionally ``tools_eval``).
+    CLEAR 1.x keeps them at the top level of each ``agents[<name>]`` entry.
+    """
+    if not isinstance(agent_data, dict):
+        return {}
+    for key in ("reasoning_eval", "tools_eval"):
+        block = agent_data.get(key)
+        if isinstance(block, dict) and (
+            "agent_summary" in block or "issues_catalog" in block or "issues" in block
+        ):
+            return block
+    if "agent_summary" in agent_data or "issues_catalog" in agent_data:
+        return agent_data
+    return {}
+
+
 def _local_only_run() -> bool:
     """True for local Eval Hub mode (no sidecar); drives DefaultCallbacks without callback_url."""
     mode = os.getenv("EVALHUB_MODE", "").strip().lower()
@@ -81,9 +113,11 @@ def _callbacks_for_adapter(adapter: FrameworkAdapter) -> JobCallbacks:
 
 
 def _run_clear_unified_pipeline(agentic_config: dict[str, Any], output_dir: Path) -> None:
-    """Drive IBM CLEAR's agentic layout: output dirs, trace prep, step-by-step run."""
-    results_dir = agentic_config["results_dir"]
-    run_name = agentic_config["run_name"]
+    """Run CLEAR's agentic pipeline: layout, trace prep, step-by-step evaluation."""
+    merged = _merge_agentic_config_with_clear_defaults(agentic_config)
+
+    results_dir = merged["results_dir"]
+    run_name = merged["run_name"]
     resolved_out, _ = get_run_output_dir(results_dir, run_name)
     if resolved_out.resolve() != output_dir.resolve():
         logger.warning(
@@ -91,13 +125,13 @@ def _run_clear_unified_pipeline(agentic_config: dict[str, Any], output_dir: Path
         )
     base = resolved_out
     output_paths = create_output_structure(base)
-    data_dir = Path(agentic_config["data_dir"])
-    from_raw = bool(agentic_config.get("from_raw_traces", True))
-    traces_data_dir = prepare_traces_data(data_dir, from_raw, output_paths, agentic_config)
+    data_dir = Path(merged["data_dir"])
+    from_raw = bool(merged.get("from_raw_traces", True))
+    traces_data_dir = prepare_traces_data(data_dir, from_raw, output_paths, merged)
     if not traces_data_dir:
         raise RuntimeError("CLEAR failed to prepare traces_data")
     ok = run_step_by_step_pipeline(
-        traces_data_dir, output_paths["step_by_step"], agentic_config
+        traces_data_dir, output_paths["step_by_step"], merged
     )
     if not ok:
         raise RuntimeError("CLEAR step-by-step pipeline reported failure")
@@ -544,34 +578,20 @@ class ClearAdapter(FrameworkAdapter):
             "data_dir": data_dir,
             "results_dir": str(output_dir.parent),
             "run_name": output_dir.name,
+            "provider": config.parameters["provider"],
+            "eval_model_name": config.parameters["eval_model_name"],
+            "overwrite": config.parameters.get("overwrite", True),
+            "max_workers": config.parameters.get("max_workers", 20),
+
+            # with current implementation, these params must keep their default values
+            "agent_framework": config.parameters.get("agent_framework", "langgraph"),
+            "observability_framework": config.parameters.get("observability_framework", "mlflow"),
             "from_raw_traces": config.parameters.get("from_raw_traces", True),
             "run_step_by_step": config.parameters.get("run_step_by_step", True),
             "run_full_trajectory": config.parameters.get("run_full_trajectory", False),
-            "provider": config.parameters["provider"],
-            "eval_model_name": config.parameters["eval_model_name"],
-            "agent_framework": config.parameters.get("agent_framework", "langgraph"),
-            "observability_framework": config.parameters.get("observability_framework", "mlflow"),
             "separate_tools": config.parameters.get("separate_tools", False),
-            "overwrite": config.parameters.get("overwrite", True),
-            "resume_enabled": False,
-            "agent_mode": True,
-            "task": config.parameters.get("task", "general"),
-            "inference_backend": config.parameters.get("inference_backend", "litellm"),
-            "perform_generation": config.parameters.get("perform_generation", False),
-            "is_reference_based": config.parameters.get("is_reference_based", False),
-            "reference_column": config.parameters.get("reference_column", "ground_truth"),
-            "model_output_column": config.parameters.get("model_output_column", "response"),
-            "model_input_column": config.parameters.get("model_input_column", "model_input"),
-            "question_column": config.parameters.get("question_column", "question"),
-            "qid_column": config.parameters.get("qid_column", "id"),
-            "max_examples_to_analyze": config.parameters.get("max_examples_to_analyze", None),
-            "use_general_prompt": config.parameters.get("use_general_prompt", True),
-            "perform_clustering": config.parameters.get("perform_clustering", True),
-            "use_full_text_for_analysis": config.parameters.get("use_full_text_for_analysis", False),
-            "max_workers": config.parameters.get("max_workers", 20),
-            "max_shortcomings": config.parameters.get("max_shortcomings", 15),
-            "min_shortcomings": config.parameters.get("min_shortcomings", 3),
-            "max_eval_text_for_synthesis": config.parameters.get("max_eval_text_for_synthesis", 1000),
+
+            # the remaining params are set internally in clear
         }
 
         if agentic_config.get("inference_backend") == "endpoint":
@@ -592,8 +612,6 @@ class ClearAdapter(FrameworkAdapter):
 
         if "eval_model_params" in config.parameters:
             agentic_config["eval_model_params"] = config.parameters["eval_model_params"]
-        else:
-            agentic_config["eval_model_params"] = {"temperature": 0.0, "max_tokens": 8096}
 
         if config.parameters and "evaluation_criteria" in config.parameters:
             agentic_config["evaluation_criteria"] = config.parameters["evaluation_criteria"]
@@ -684,7 +702,15 @@ class ClearAdapter(FrameworkAdapter):
         agent_scores = []
 
         for agent_name, agent_data in agents.items():
-            summary = agent_data.get("agent_summary", {})
+            payload = _normalize_clear_agent_entry(agent_data)
+            if not payload:
+                logger.warning(
+                    "Skipping agent %r: no agent_summary/issues in CLEAR 1.x or 2.x shape",
+                    agent_name,
+                )
+                continue
+
+            summary = payload.get("agent_summary", {})
             avg_score = summary.get("avg_score", 0.0)
             agent_scores.append(avg_score)
 
@@ -696,7 +722,7 @@ class ClearAdapter(FrameworkAdapter):
                 )
             )
 
-            issues_catalog = agent_data.get("issues_catalog", {})
+            issues_catalog = payload.get("issues_catalog", {})
             num_issues = len(issues_catalog)
 
             evaluation_results.append(
